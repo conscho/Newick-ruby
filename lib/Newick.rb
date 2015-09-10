@@ -81,6 +81,10 @@ class NewickNode
   attr :edgeLen, true
   # name of node
   attr :name, true
+  # nucleotides of node
+  attr_accessor :nucleotides
+  # already calculated subtree
+  attr_accessor :calculated_subtrees
   # child nodes of node
   attr_reader :children
   # x position of node
@@ -91,9 +95,89 @@ class NewickNode
   def initialize(name, edgeLen)
     @parent = nil
     @name = name
+    @nucleotides = ""
+    @calculated_subtrees = Hash.new([])
     @edgeLen = edgeLen
     @children = []
   end
+
+  def tree_traversal_and_operations_count(site_number, simulate = false)  # with and without SR (subtree repeats)
+    subtree_string = ''
+    count_of_children = 1 # 1 calculcation if leaf_leaf
+    count_of_grandchildren_SR = 0 # initializing variable. Considering subtree repeats.
+    count_of_grandchildren = 0 # initializing variable. Not considering subtree repeats.
+
+    @children.each do |child|
+      if child.leaf?
+        subtree_string += child.nucleotides[site_number]
+      else
+        count_of_children = count_of_children * 4 # 4 calculations if inner_leaf and 16 if inner_inner
+        result = child.tree_traversal_and_operations_count(site_number, simulate)
+        count_of_grandchildren += result[:op_maximum]
+        count_of_grandchildren_SR += result[:op_optimized]
+        subtree_string += result[:subtree_string]
+      end
+    end
+
+    # Count of operations with SR optimization & add calculated subtree (= equivalence classes)
+    op_optimized = if @calculated_subtrees.has_key?(subtree_string)
+                     @calculated_subtrees[subtree_string] << site_number unless simulate
+                     0
+                   else
+                     @calculated_subtrees[subtree_string] = [site_number] unless simulate
+                     count_of_children + count_of_grandchildren_SR
+                   end
+
+    # Count of operations without SR optimization
+    op_maximum = count_of_children + count_of_grandchildren
+
+    return {op_maximum: op_maximum, op_optimized: op_optimized, subtree_string: subtree_string}
+  end
+
+  # Clear the value @calculated_subtrees from all child nodes
+  def clear_calculated_subtrees
+    @calculated_subtrees.clear
+    @children.each do |child|
+      child.clear_calculated_subtrees
+    end
+  end
+
+  # For all node: Get the subtree site patterns and the sites that form each pattern
+  def dependencies_per_subtree
+    collect_dependencies = []
+    descendants.each do |node|
+      next if node.calculated_subtrees.empty?
+      collect_dependencies << node.calculated_subtrees.values
+    end
+    collect_dependencies.flatten(1).map {|x| x if x.size > 1}.compact
+  end
+
+  # Set the @edgeLen to 1 from self and all child nodes
+  def set_edge_length!
+    @edgeLen = 1
+    @children.each do |child|
+      child.set_edge_length!
+    end
+  end
+
+  # return hash of names and nucleotides of leaves (taxa) that are contained in the node
+  def taxa_with_nucleotides
+    taxa = {}
+    if (!leaf?)
+      @children.each do |child|
+        taxa = taxa.merge(child.taxa_with_nucleotides)
+      end
+    else
+      taxa = {@name => @nucleotides}
+    end
+    return taxa
+  end
+
+
+  ########################
+  ## Changes until here ##
+  ########################
+
 
   # adds child node to list of children and sets child's parent to self
   def addChild(child)
@@ -409,6 +493,115 @@ class NewickTree
       end
     end
   end
+
+  # save nucleotides at leaves of tree
+  def add_dna_sequences(phylip_data)
+    phylip_data.each do |key, value|
+      target_node = self.findNode(key.to_s, true)
+
+      # Error check
+      if target_node
+        target_node.nucleotides = value
+      else
+        raise NewickParseError, "The genes don't fit the tree"
+      end
+    end
+
+    return self
+  end
+
+
+  # how many ML operations for specific partition_sites
+  def ml_operations!(partition_sites, new_partition = true, simulate = false)
+    @root.clear_calculated_subtrees if new_partition # clear previous values
+
+    op_maximum = 0 # count of calculations for each site without skipping SR (= subtree repeats)
+    op_optimized = 0 # count of calculations for each site with skipping SR (= subtree repeats)
+    partition_sites.each do |site|
+      result = @root.tree_traversal_and_operations_count(site, simulate)
+      op_maximum += result[:op_maximum]
+      op_optimized += result[:op_optimized]
+    end
+
+    return {op_maximum: op_maximum,
+            op_optimized: op_optimized,
+            op_savings: ((op_maximum.to_f - op_optimized.to_f) / op_maximum.to_f * 100)}
+  end
+
+  def clear_calculated_subtrees
+    @root.clear_calculated_subtrees
+  end
+
+  def drop_taxon
+    # FIXME: Cropping of taxa which is a direct leaf of the root will crash. Does that happen?
+
+    leaves = @root.leaves
+    drop_taxon = leaves[leaves.size/2]
+
+    drop_taxon.parent.parent.addChild(drop_taxon.siblings[0])
+    drop_taxon.parent.parent.removeChild(drop_taxon.parent)
+
+    return self
+  end
+
+
+  def get_site_dependencies
+    dependencies = @root.dependencies_per_subtree
+
+    edges = dependencies.map {|sev| sev.combination(2).to_a }.
+        flatten(1).each_with_object(Hash.new(0)) {|dependency, count| count[dependency] += 1}
+    dependencies_count = dependencies.flatten.each_with_object(Hash.new(0)) {|site, count| count[site] += 1}
+
+    return {dependencies_count: dependencies_count, edges: edges}
+  end
+
+  # set edgeLen of all nodes of the tree to 1 if there were no edgeLen in newick file. Required for midpointRoot
+  def set_edge_length!
+    @root.set_edge_length!
+    self
+  end
+
+  def nodes
+    return @root.descendants
+  end
+
+  # Sort sites lexicographically per partition
+  def sort_sites!(partitions)
+    # Get taxa sorted via tree traversal
+    taxa = self.taxa_with_nucleotides
+
+    # Lexicographic sort sites per partition
+    all_sites = taxa.values.map {|nucleotides| nucleotides.split('') }.transpose
+    partitions.each do |partition|
+      all_sites[(partition.sites.first .. partition.sites.last)] = all_sites[(partition.sites.first .. partition.sites.last)].sort
+    end
+
+    # Save in tree
+    self.add_dna_sequences(Hash[taxa.keys.zip(all_sites.transpose)])
+  end
+
+  # return hash of taxa name and nucleotides in tree
+  def taxa_with_nucleotides
+    return @root.taxa_with_nucleotides
+  end
+
+  # return number of nodes to most distant leaf
+  def height
+    leaves = @root.leaves
+    height = 0
+    leaves.each do |leaf|
+      height_of_leaf = leaf.nodesToAncestor(@root)
+      height = height_of_leaf if height < height_of_leaf
+    end
+    height
+  end
+
+
+  ########################
+  ## Changes until here ##
+  ########################
+
+
 
   # return string representation of tree
   def to_s(showLen = true, bootStrap = "node")
