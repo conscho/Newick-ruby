@@ -1,3 +1,6 @@
+Here be dragons: Forked to add functionality for subtree repeat analysis in ML operations as in RAxML
+
+Credits and original code by Jonathan Badger:
 Ruby routines for manipulating Newick trees. See http://en.wikipedia.org/wiki/Newick_format for a description of what Newick trees are if you don't know, but chances are, if you don't already know, this isn't going to be very useful code to you.
 
 I'm aware that BioRuby has Newick routines as of late, although I'm not sure if they do all my code does, plus I started my code several years ago when BioRuby was just starting out. I'm all for anyone taking what they find useful from my code and integrating it into BioRuby, though.
